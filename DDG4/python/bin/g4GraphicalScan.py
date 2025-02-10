@@ -68,6 +68,9 @@ parser.add_option('-o', '--outputFile',
                   dest='outFile', default='output.root',
                   help='name of ouput root file',
                   metavar='<string>')
+parser.add_option("-P", "--noPilot",
+                  action="store_true", dest="noPilot", default=False,
+                  help="don't print status messages to stdout")
 
 (opts, args) = parser.parse_args()
 #
@@ -140,6 +143,9 @@ if nBins < 1:
     print('ERROR: crazy number of bins requested', nBins, file=sys.stderr)
     exit(1)
 
+noPilot = bool(opts.noPilot)
+print('noPilot', noPilot)
+
 outFileName = str(opts.outFile)
 #
 # define the "mother" histogram according to the requested slice type, ranges, number of bins
@@ -160,7 +166,6 @@ elif sliceType == 'ZY':
     h2.GetYaxis().SetTitle('y [mm]')
 h2.Fill(0, 0, 0.0)  # to ensure there is at least one entry...otherwise doesn't get drawn...
 
-edgeOfWorld = -15000.  # mm
 #
 # this is where the materials will be stored
 #
@@ -169,6 +174,12 @@ mats = {}
 # we make scans along the X and Y axes of the mother histogram
 # prepare the input macro to ddsim
 #
+pilotName = '_pilot_' + outFileName + '.mac'
+pilotMac = open(pilotName, 'w')
+pilotMac.write('/gun/particle geantino' + '\n')
+pilotMac.write('/gun/energy 20 GeV' + '\n')
+pilotMac.write('/gun/number 1' + '\n')
+
 steerName = '_' + outFileName + '.mac'
 steerMac = open(steerName, 'w')
 steerMac.write('/gun/particle geantino' + '\n')
@@ -176,6 +187,7 @@ steerMac.write('/gun/energy 20 GeV' + '\n')
 steerMac.write('/gun/number 1' + '\n')
 
 for iDir in range(0, 2):
+    npilot=0
     mats[iDir] = {}
     if iDir == 0:
         axis = h2.GetXaxis()
@@ -213,42 +225,84 @@ for iDir in range(0, 2):
         if iDir == 0:
             if sliceType == 'XY':
                 startPos = str(X) + ' '
-                startPos += str(edgeOfWorld) + ' '
+                startPos += str(yRange[0]) + ' '
                 startPos += str(zRange)
             elif sliceType == 'ZX':
-                startPos = str(edgeOfWorld) + ' '
+                startPos = str(xRange[0]) + ' '
                 startPos += str(yRange) + ' '
                 startPos += str(X)
             elif sliceType == 'ZY':
                 startPos = str(xRange) + ' '
-                startPos += str(edgeOfWorld) + ' '
+                startPos += str(yRange[0]) + ' '
                 startPos += str(X)
         else:
             if sliceType == 'XY':
-                startPos = str(edgeOfWorld) + ' '
+                startPos = str(xRange[0]) + ' '
                 startPos += str(X) + ' '
                 startPos += str(zRange)
             elif sliceType == 'ZX':
                 startPos = str(X) + ' '
                 startPos += str(yRange) + ' '
-                startPos += str(edgeOfWorld)
+                startPos += str(zRange[0])
             elif sliceType == 'ZY':
                 startPos = str(xRange) + ' '
                 startPos += str(X) + ' '
-                startPos += str(edgeOfWorld)
+                startPos += str(zRange[0])
 
         steerMac.write('/gun/position ' + startPos + ' mm \n')
         steerMac.write('/run/beamOn' + '\n')
 
+        if npilot < 1:
+            pilotMac.write('/gun/position ' + startPos + ' mm \n')
+            pilotMac.write('/run/beamOn' + '\n')
+            npilot += 1
+
 steerMac.write('exit')
 steerMac.close()
 
+pilotMac.write('exit')
+pilotMac.close()
+#
+# first try a pilot run to check model is OK
+#
+if noPilot == False:
+    cmd = ['ddsim', '--compactFile', infileName, '--runType', 'run', '--enableG4Gun',
+           '--action.step', 'Geant4MaterialScanner/MaterialScan', '-M', pilotName]
+
+    print('running test pilot job...\n')
+
+    for cc in cmd:
+        print(cc, end=' ')
+    print ('\n')
+
+    pilotresult = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    print('done, checking pilot result')
+
+    has_Material_scan_between = 0
+    has_Finished_run = 0
+
+    for ll in pilotresult.stdout.splitlines():
+        if 'Material scan between' in ll:
+            has_Material_scan_between += 1
+        if 'Finished run' in ll:
+            has_Finished_run += 1
+
+    if has_Material_scan_between != 2 or has_Finished_run != 2:
+        print('ERROR, pilot job seems not to have finished successfully')
+        for ll in pilotresult.stdout.splitlines():
+            print(ll)
+        print('ERROR, pilot job seems not to have finished successfully')
+
+    print('pilot job seems OK')        
 #
 # run ddsim with this macro
 #
 cmd = ['ddsim', '--compactFile', infileName, '--runType', 'run', '--enableG4Gun',
        '--action.step', 'Geant4MaterialScanner/MaterialScan', '-M', steerName]
-result = subprocess.run(cmd, capture_output=True, text=True)
+
+print('now running main ddsim job..this may take some time')
+
+result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 #
 # parse the results
 #
@@ -256,6 +310,11 @@ iscan = 1
 inScan = False
 iDir = 0
 for line in result.stdout.splitlines():
+    # write out any errors or warnings
+    lowline=line.lower()
+    if 'error' in lowline or 'warn' in lowline:
+        print(line)
+
     if 'Material scan between' in line:
         gg = line.split(')')[0].split('(')[1].split(',')
         startx = 10 * float(gg[0])  # convert cm -> mm
@@ -276,7 +335,7 @@ for line in result.stdout.splitlines():
         continue
     elif r"| Layer \ " in line:          # comment line
         continue
-    elif inScan:   # this line contains material information
+    elif inScan and len(line.split()) == 16 and line.split()[0] == '|':   # this line contains material information
         index = int(line.split()[1])
         material = line.split()[2]
         radlen = 10 * float(line.split()[6])     # cm->mm
@@ -311,7 +370,7 @@ for iDir in range(0, 2):   # the two directions
         hxh = scanaxis.GetBinUpEdge(hxn)
         hxbw = scanaxis.GetBinWidth(1)
 
-        curpos = edgeOfWorld
+        curpos = hxl
 
         for value in scandat.values():
             begpos = curpos
